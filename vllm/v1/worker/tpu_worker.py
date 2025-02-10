@@ -17,8 +17,10 @@ from vllm.v1.kv_cache_interface import FullAttentionSpec
 from vllm.v1.attention.backends.pallas import PallasAttentionBackend
 from vllm.v1.core.scheduler import SchedulerOutput
 from vllm.v1.outputs import ModelRunnerOutput
+from vllm.utils import STR_DTYPE_TO_TORCH_DTYPE, LayerBlockType, get_dtype_size
 from vllm.v1.worker.tpu_model_runner import ExecutionMode, TPUModelRunner
 from vllm.v1.worker.worker_base import WorkerBase
+from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 from vllm.v1.utils import bind_kv_cache
 
 logger = init_logger(__name__)
@@ -34,8 +36,50 @@ class TPUWorker(WorkerBase):
         distributed_init_method: str,
         is_driver_worker: bool = False,
     ):
-        super().__init__(vllm_config, local_rank, rank,
-                         distributed_init_method)
+        self.vllm_config = vllm_config
+        self.model_config = vllm_config.model_config
+        self.cache_config = vllm_config.cache_config
+        self.lora_config = vllm_config.lora_config
+        self.load_config = vllm_config.load_config
+        self.parallel_config = vllm_config.parallel_config
+        self.scheduler_config = vllm_config.scheduler_config
+        self.device_config = vllm_config.device_config
+        self.speculative_config = vllm_config.speculative_config
+        self.prompt_adapter_config = vllm_config.prompt_adapter_config
+        self.observability_config = vllm_config.observability_config
+
+        self.parallel_config.rank = rank
+        self.local_rank = local_rank
+        self.rank = rank
+        self.distributed_init_method = distributed_init_method
+
+        if self.cache_config.cache_dtype == "auto":
+            self.cache_dtype = self.model_config.dtype
+        else:
+            self.cache_dtype = STR_DTYPE_TO_TORCH_DTYPE[
+                self.cache_config.cache_dtype]
+
+        if self.model_config.trust_remote_code:
+            # note: lazy import to avoid importing torch before initializing
+            from vllm.utils import init_cached_hf_modules
+            init_cached_hf_modules()
+
+        # Torch profiler. Enabled and configured through env vars:
+        # VLLM_TORCH_PROFILER_DIR=/path/to/save/trace
+        if envs.VLLM_TORCH_PROFILER_DIR:
+            torch_profiler_trace_dir = envs.VLLM_TORCH_PROFILER_DIR
+            logger.info("Profiling enabled. Traces will be saved to: %s",
+                        torch_profiler_trace_dir)
+            self.profiler = torch.profiler.profile(
+                activities=[
+                    torch.profiler.ProfilerActivity.CPU,
+                    torch.profiler.ProfilerActivity.CUDA,
+                ],
+                with_stack=True,
+                on_trace_ready=torch.profiler.tensorboard_trace_handler(
+                    torch_profiler_trace_dir, use_gzip=True))
+        else:
+            self.profiler = None
 
     def init_device(self):
         os.environ["PJRT_DEVICE"] = "TPU"
@@ -129,6 +173,44 @@ class TPUWorker(WorkerBase):
         output = self.model_runner.execute_model(scheduler_output)
         return output if self.rank == 0 else None
 
+    def load_model(self) -> None:
+        assert self.model_runner is not None
+        self.model_runner.load_model()
+
+    def compile_or_warm_up_model(self) -> None:
+        assert self.model_runner is not None
+
+        if not self.model_config.enforce_eager:
+            self.model_runner.capture_model()
+
+        # Reset the seed to ensure that the random state is not affected by
+        # the model initialization and profiling.
+        set_random_seed(self.model_config.seed)
+
+    def get_model(self) -> nn.Module:
+        assert self.model_runner is not None
+        return self.model_runner.get_model()
+
+    def get_kv_cache_spec(self) -> KVCacheSpec:
+        assert self.model_runner is not None
+        return self.model_runner.get_kv_cache_spec()
+
+    def initialize_cache(self, kv_cache_config: KVCacheConfig) -> None:
+        """Allocate GPU KV cache with the specified kv_cache_config."""
+        assert self.model_runner is not None
+        self.model_runner.initialize_kv_cache(kv_cache_config)
+
+    def profile(self, is_start: bool = True):
+        if self.profiler is None:
+            raise RuntimeError("Profiler is not enabled.")
+        if is_start:
+            self.profiler.start()
+        else:
+            self.profiler.stop()
+
+    def check_health(self) -> None:
+        # worker will always be healthy as long as it's running.
+        return
 
 def init_tpu_worker_distributed_environment(
     parallel_config: ParallelConfig,

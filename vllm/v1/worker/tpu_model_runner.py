@@ -31,11 +31,9 @@ from vllm.v1.attention.backends.pallas import (PallasAttentionBackend,
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.utils import bind_kv_cache
-from vllm.v1.worker.gpu_input_batch import (CachedRequestState, InputBatch,
-                                            ensure_decodes_first)
+from vllm.v1.worker.gpu_input_batch import (CachedRequestState, InputBatch)
 from vllm.v1.kv_cache_interface import (FullAttentionSpec, KVCacheConfig,
                                         KVCacheSpec)
-from vllm.v1.worker.model_runner_base import ExecutionMode, ModelRunnerBase
 from vllm.v1.core.kv_cache_utils import get_kv_cache_config
 
 if TYPE_CHECKING:
@@ -1124,6 +1122,79 @@ class ModelWrapperV1(nn.Module):
         argmax_token_ids = argmax_token_ids.squeeze(dim=-1)
         return argmax_token_ids
 
+
+def swap_positions(b: InputBatch, id_1, id_2):
+    assert id_1 != id_2
+    req_id_1 = b.req_ids[id_1]
+    req_id_2 = b.req_ids[id_2]
+    assert req_id_1 is not None
+    assert req_id_2 is not None
+    assert id_1 == b.req_id_to_index[req_id_1]
+    assert id_2 == b.req_id_to_index[req_id_2]
+
+    b.req_ids[id_1], b.req_ids[id_2] = b.req_ids[id_2], b.req_ids[id_1]
+    b.req_id_to_index[req_id_1], b.req_id_to_index[
+        req_id_2] = b.req_id_to_index[req_id_2], b.req_id_to_index[req_id_1]
+
+    ids = [id_1, id_2]
+    rev_ids = [id_2, id_1]
+    b.num_tokens[ids] = b.num_tokens[rev_ids]
+    b.token_ids_cpu[ids] = b.token_ids_cpu[rev_ids]
+    b.num_prompt_tokens[ids] = b.num_prompt_tokens[rev_ids]
+    b.num_computed_tokens_cpu[ids] = b.num_computed_tokens_cpu[rev_ids]
+
+    b.block_table.swap_row(id_1, id_2)
+
+    b.temperature_cpu[ids] = b.temperature_cpu[rev_ids]
+    b.top_p_cpu[ids] = b.top_p_cpu[rev_ids]
+    b.top_k_cpu[ids] = b.top_k_cpu[rev_ids]
+    b.frequency_penalties_cpu[ids] = b.frequency_penalties_cpu[rev_ids]
+    b.presence_penalties_cpu[ids] = b.presence_penalties_cpu[rev_ids]
+    b.repetition_penalties_cpu[ids] = b.repetition_penalties_cpu[rev_ids]
+
+    b.min_tokens[id_1], b.min_tokens[id_2] = b.min_tokens[id_2], b.min_tokens[
+        id_1]
+    b.stop_token_ids[id_1], b.stop_token_ids[id_2] = b.stop_token_ids[
+        id_2], b.stop_token_ids[id_1]
+
+    gen_1 = b.generators.pop(id_1, None)
+    gen_2 = b.generators.pop(id_2, None)
+    if gen_1 is not None:
+        b.generators[id_2] = gen_1
+    if gen_2 is not None:
+        b.generators[id_1] = gen_2
+
+
+def ensure_decodes_first(b: InputBatch):
+    num_reqs = b.num_reqs
+    while True:
+        # Find the first prompt index
+        first_prompt_index = None
+        for i in range(num_reqs):
+            if b.num_computed_tokens_cpu[i] < b.num_prompt_tokens[i]:
+                first_prompt_index = i
+                break
+        if first_prompt_index is None:
+            break
+
+        # Find the last decode index
+        last_decode_index = None
+        for i in reversed(range(num_reqs)):
+            if b.num_computed_tokens_cpu[i] >= b.num_prompt_tokens[i]:
+                last_decode_index = i
+                break
+        if last_decode_index is None:
+            break
+
+        # Sanity
+        assert first_prompt_index != last_decode_index
+
+        # Check if done
+        if first_prompt_index > last_decode_index:
+            break
+
+        # Swap
+        swap_positions(b, first_prompt_index, last_decode_index)
 
 def _get_padded_prompt_len(x: int) -> int:
     # NOTE(woosuk): The pallas FlashAttention kernel requires the sequence
